@@ -44,6 +44,7 @@ if "profile" in os.environ.get("DEBUG", ""):
 
 
 BUILD_WORKSPACE_DIRECTORY = Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", os.getcwd()))
+COMPILE_COMMANDS_PATH = BUILD_WORKSPACE_DIRECTORY / "compile_commands.json"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,9 @@ def main(
     dump_aquery_output: T.Optional[Path],
     load_aquery_output: T.Optional[Path],
     proto_type: T.Literal["proto", "jsonproto"],
+    include_deps: bool,
+    patch: bool,
+    output_path: Path,
 ) -> None:
     exec_root = generate_exec_root()
 
@@ -80,7 +84,9 @@ def main(
     else:
         print("Running aquery...", file=sys.stderr)
         aquery_stdout = run_aquery(
-            f"deps({query})", extra_args=extra_aquery_args, proto_type=proto_type
+            f"deps({query})" if include_deps else query,
+            extra_args=extra_aquery_args,
+            proto_type=proto_type,
         )
 
     if dump_aquery_output is not None:
@@ -98,29 +104,104 @@ def main(
     # TODO(danny): relative paths should work, but the VSCode clangd plugin doesn't work right
     # if it finds compile_commands.json in a subdirectory (e.g. the example in this project).
     absolute_exec_root = str(exec_root.absolute())
-    with open(BUILD_WORKSPACE_DIRECTORY / "compile_commands.json", "w", encoding="utf-8") as f:
-        f.write("[\n")
-        wrote_output = False
+
+    if patch:
+        # NOTE(aaron): This is pretty fast, but it does read the whole compile_commands.json into
+        # memory, and write out a whole new file.  Naively, this is unavoidable, because the new
+        # compile command for a given file might be bigger than the old one, so we can't just
+        # overwrite it in place.  We could overwrite it with whitespace and put the new commands at
+        # the end, and we could keep an index of where all the compile commands are to avoid reading
+        # the whole file.  Both of those are left as future possibilities for now.
+        commands = {}
         for compile_command in process_actions(
             aquery_output,
             munge_command_line=munge_command_line,
             progress=pbar.update if pbar else None,
         ):
-            wrote_output = True
-            f.write(
-                '{{"file": {}, "arguments": {}, "directory": {}}},\n'.format(
-                    json.dumps(compile_command.path),
-                    compile_command.args.args_encoded,
-                    json.dumps(absolute_exec_root),
-                )
+            commands[json.dumps(compile_command.path)] = (
+                compile_command.args.args_encoded,
+                json.dumps(absolute_exec_root),
             )
-        # Remove trailing comma
-        if wrote_output:
-            f.seek(f.tell() - 2)
-        f.write("\n]\n")
 
         if pbar is not None:
             pbar.close()
+
+        tmp_output_path = output_path.parent / (f".{output_path.name}.tmp")
+        with tmp_output_path.open("w") as f_out:
+            wrote_output = False
+
+            with output_path.open("r") as f_in:
+                for line in f_in:
+                    if line == "[\n":
+                        f_out.write(line)
+                        continue
+                    if line == "]\n":
+                        break
+
+                    # This is intentionally simple to avoid json decoding.  It'll break if you have
+                    # a compile command with a filename that contains a comma.
+                    comma = line.index(",")
+                    filename_encoded = line[len('{"file": ') : comma]
+
+                    if filename_encoded in commands:
+                        args_encoded, exec_root_encoded = commands.pop(filename_encoded)
+
+                        f_out.write(
+                            '{{"file": {}, "arguments": {}, "directory": {}}}'.format(
+                                filename_encoded, args_encoded, exec_root_encoded
+                            )
+                        )
+
+                        if line.endswith(",\n"):
+                            f_out.write(",\n")
+                        else:
+                            f_out.write("\n")
+                    else:
+                        f_out.write(line)
+
+                    wrote_output = True
+
+            if commands:
+                if wrote_output:
+                    f_out.seek(f_out.tell() - 1)
+                    f_out.write(",\n")
+
+                for filename_encoded, (args_encoded, exec_root_encoded) in commands.items():
+                    f_out.write(
+                        '{{"file": {}, "arguments": {}, "directory": {}}},\n'.format(
+                            filename_encoded, args_encoded, exec_root_encoded
+                        )
+                    )
+
+                f_out.seek(f_out.tell() - 2)
+                f_out.write("\n")
+
+            f_out.write("]\n")
+
+        tmp_output_path.replace(output_path)
+    else:
+        with output_path.open("w") as f:
+            f.write("[\n")
+            wrote_output = False
+            for compile_command in process_actions(
+                aquery_output, munge_command_line=munge_command_line, progress=pbar.update
+            ):
+                wrote_output = True
+                f.write(
+                    '{{"file": {}, "arguments": {}, "directory": {}}},\n'.format(
+                        json.dumps(compile_command.path),
+                        compile_command.args.args_encoded,
+                        json.dumps(absolute_exec_root),
+                    )
+                )
+            # Remove trailing comma
+            if wrote_output:
+                f.seek(f.tell() - 2)
+                f.write("\n")
+            f.write("]\n")
+
+            if pbar is not None:
+                pbar.close()
 
 
 def generate_exec_root() -> Path:
@@ -367,6 +448,21 @@ def process_actions(
             increment_completed_actions()
 
 
+BASE_EXCLUDED_COMPILER_ARGS = [
+    # Always filter out -fno-canonical-system-headers
+    # It's a gcc option that confuses clangd. It's added by Bazel's default host
+    # toolchain. clang doesn't need this option, as it does the right thing by
+    # default.
+    "-fno-canonical-system-headers",
+]
+
+
+# We've seen bad behavior when clangd uses --query-driver to add system headers.
+# We use this to remove includes that break `#include_next`.
+# See https://discourse.llvm.org/t/in-included-file-stdlib-h-file-not-found/1694/6
+DEFAULT_EXCLUDED_SYSTEM_INCLUDES = []
+
+
 def create_command_line_munger(
     exclude_args: T.Set[str], exclude_system_includes: T.Set[str]
 ) -> Munger:
@@ -434,6 +530,25 @@ if __name__ == "__main__":
         "--proto_type", help="aquery output format", default="proto", choices=("proto", "jsonproto")
     )
 
+    parser.add_argument(
+        "--no_deps",
+        help="Don't include dependencies in the query",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--patch",
+        help="Patch output_path contents with updated targets from this run, instead of overwriting entirely",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--output_path",
+        help="Output path for compile_commands.json",
+        type=Path,
+        default=COMPILE_COMMANDS_PATH,
+    )
+
     if argcomplete is not None:
         argcomplete.autocomplete(parser)
     args = parser.parse_args()
@@ -443,24 +558,17 @@ if __name__ == "__main__":
             args.query,
             extra_aquery_args=args.extra_aquery_arg,
             munge_command_line=create_command_line_munger(
-                exclude_args=set(
-                    args.exclude_compile_arg
-                    + [
-                        # Always filter out -fno-canonical-system-headers
-                        # It's a gcc option that confuses clangd. It's added by Bazel's default host
-                        # toolchain. clang doesn't need this option, as it does the right thing by
-                        # default.
-                        "-fno-canonical-system-headers",
-                    ]
+                exclude_args=set(args.exclude_compile_arg + BASE_EXCLUDED_COMPILER_ARGS),
+                exclude_system_includes=set(
+                    args.exclude_system_include or DEFAULT_EXCLUDED_SYSTEM_INCLUDES
                 ),
-                # We've seen bad behavior when clangd uses --query-driver to add system headers.
-                # We use this to remove includes that break `#include_next`.
-                # See https://discourse.llvm.org/t/in-included-file-stdlib-h-file-not-found/1694/6
-                exclude_system_includes=set(args.exclude_system_include),
             ),
             dump_aquery_output=args.dump_aquery_output,
             load_aquery_output=args.load_aquery_output,
             proto_type=args.proto_type,
+            include_deps=not args.no_deps,
+            patch=args.patch,
+            output_path=args.output_path,
         )
     except KeyboardInterrupt:
         pass
